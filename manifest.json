@@ -1,0 +1,16 @@
+{
+  "sf2s": [
+    "uzdoom.sf2"
+  ],
+  "midis": [
+    { "file": "D_ALTWIN.mid",  "title": null },
+    { "file": "D_STG001.mid",  "title": null },
+    { "file": "D_STG002.mid",  "title": null },
+    { "file": "D_STG003.mid",  "title": null },
+    { "file": "D_STG004.mid",  "title": null },
+    { "file": "D_STG005.mid",  "title": null },
+    { "file": "D_STG006.mid",  "title": null },
+    { "file": "D_STG788.mid",  "title": null },
+    { "file": "D_TESTER.mid",  "title": null }
+  ]
+}
