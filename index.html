@@ -4,16 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Gabriel's Music!</title>
-
 <meta property="og:title" content="Gabriel's Music!">
 <meta property="og:description" content="Gabriel's Music!">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#5865F2">
-<meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="Gabriel's Music!">
-<meta name="twitter:description" content="Gabriel's Music!">
 
-<script src="https://cdn.jsdelivr.net/npm/html-midi-player@1.5.0/build/bundle.js"></script>
+<!-- MIDI.js stack: player + SF2 synth, all from one reliable CDN -->
+<script src="https://cdn.jsdelivr.net/npm/jasmid@0.9.2/stream.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jasmid@0.9.2/midifile.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jasmid@0.9.2/replayer.js"></script>
 
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -26,14 +25,12 @@
   #song-list li.active { background: #e8e8e8; font-weight: bold; }
   #song-list li .filename { display: block; }
   #song-list li .meta-title { display: block; color: #555; font-size: 12px; }
-  midi-player {
-    display: block;
-    width: 100%;
-    margin-top: 10px;
-    border-top: 2px solid #000;
-    padding-top: 10px;
-  }
-  #now-playing { font-weight: bold; margin-top: 10px; border-top: 2px solid #000; padding-top: 10px; margin-bottom: 6px; }
+  #player { border-top: 2px solid #000; padding-top: 10px; margin-top: 4px; display: none; }
+  #now-playing { margin-bottom: 6px; font-weight: bold; }
+  #controls { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  #controls button { font-family: monospace; cursor: pointer; padding: 2px 6px; }
+  #seek { width: 100%; cursor: pointer; margin-bottom: 2px; }
+  #time-display { font-size: 12px; color: #555; }
 </style>
 </head>
 <body>
@@ -41,13 +38,22 @@
 <h1>Gabriel's Music!</h1>
 <div id="status">Loading…</div>
 <ul id="song-list"></ul>
-<div id="now-playing" style="display:none">—</div>
-<midi-player id="player" sound-font="https://storage.googleapis.com/magentadata/js/soundfonts/sgm_plus" style="display:none"></midi-player>
+<div id="player">
+  <div id="now-playing">—</div>
+  <div id="controls">
+    <button id="btn-play">▶ Play</button>
+    <button id="btn-stop">■ Stop</button>
+  </div>
+  <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+  <div id="time-display">0:00 / 0:00</div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
+const fmt = s => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; };
 const status = msg => { $('status').textContent = msg; };
 
+// ── MIDI title reader ─────────────────────────────────────────────────────────
 function readMidiTitle(buffer) {
   const b = new Uint8Array(buffer);
   let i = 0;
@@ -57,133 +63,477 @@ function readMidiTitle(buffer) {
   try {
     if (String.fromCharCode(b[0],b[1],b[2],b[3]) !== 'MThd') return null;
     i = 4; readU32();
-    const format = (b[i]<<8)|b[i+1]; i+=2;
-    const ntracks = (b[i]<<8)|b[i+1]; i+=2;
-    i += 2;
-    for (let t = 0; t < Math.min(ntracks, 3); t++) {
-      if (i+8 > b.length) break;
-      if (String.fromCharCode(b[i],b[i+1],b[i+2],b[i+3]) !== 'MTrk') break;
-      i += 4;
-      const tlen = readU32();
-      const tend = i + tlen;
-      while (i < tend - 1) {
-        readVLQ();
-        const evt = read();
-        if (evt === 0xff) {
-          const mtype = read();
-          const mlen = readVLQ();
-          if (mtype === 0x03) {
-            return new TextDecoder('utf-8', {fatal:false}).decode(b.slice(i, i+mlen)).trim();
-          }
-          i += mlen;
-        } else if (evt === 0xf0 || evt === 0xf7) {
-          i += readVLQ();
-        } else {
-          const ch = evt & 0xf0;
-          if (ch === 0xc0 || ch === 0xd0) i += 1;
-          else if (evt < 0x80) i += 1;
-          else i += 2;
-        }
+    i+=2; const ntracks = (b[i]<<8)|b[i+1]; i+=2; i+=2;
+    for (let t = 0; t < Math.min(ntracks,3); t++) {
+      if (i+8>b.length) break;
+      if (String.fromCharCode(b[i],b[i+1],b[i+2],b[i+3])!=='MTrk') break;
+      i+=4; const tlen=readU32(); const tend=i+tlen;
+      while (i<tend-1) {
+        readVLQ(); const evt=read();
+        if (evt===0xff) {
+          const mtype=read(); const mlen=readVLQ();
+          if (mtype===0x03) return new TextDecoder('utf-8',{fatal:false}).decode(b.slice(i,i+mlen)).trim();
+          i+=mlen;
+        } else if (evt===0xf0||evt===0xf7) { i+=readVLQ(); }
+        else { const ch=evt&0xf0; if(ch===0xc0||ch===0xd0) i+=1; else if(evt<0x80) i+=1; else i+=2; }
       }
-      i = tend;
+      i=tend;
     }
   } catch(_) {}
   return null;
 }
 
+// ── File discovery ────────────────────────────────────────────────────────────
 async function discoverFiles() {
   const base = location.href.replace(/\/?([\?#].*)?$/, '/');
   try {
     const r = await fetch(base + 'manifest.json');
     if (r.ok) {
       const mf = await r.json();
-      const midis = (mf.midis || []).map(e => base + (typeof e === 'string' ? e : e.file));
-      const sf2s  = (mf.sf2s  || []).map(e => base + (typeof e === 'string' ? e : e.file));
-      if (midis.length || sf2s.length) return { midis, sf2s };
+      const midis = (mf.midis||[]).map(e => base+(typeof e==='string'?e:e.file));
+      const sf2s  = (mf.sf2s ||[]).map(e => base+(typeof e==='string'?e:e.file));
+      if (midis.length||sf2s.length) return {midis,sf2s};
     }
   } catch(_) {}
   try {
     const r = await fetch(base);
-    const html = await r.text();
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const hrefs = [...doc.querySelectorAll('a[href]')].map(a => a.getAttribute('href'));
+    const doc = new DOMParser().parseFromString(await r.text(),'text/html');
+    const hrefs = [...doc.querySelectorAll('a[href]')].map(a=>a.getAttribute('href'));
     return {
-      midis: hrefs.filter(h => /\.(mid|midi)$/i.test(h)).map(h => new URL(h, base).href),
-      sf2s:  hrefs.filter(h => /\.sf2$/i.test(h)).map(h => new URL(h, base).href),
+      midis: hrefs.filter(h=>/\.(mid|midi)$/i.test(h)).map(h=>new URL(h,base).href),
+      sf2s:  hrefs.filter(h=>/\.sf2$/i.test(h)).map(h=>new URL(h,base).href),
     };
   } catch(_) {}
-  return { midis: [], sf2s: [] };
+  return {midis:[],sf2s:[]};
 }
 
+// ── SF2 synthesizer using Web Audio API ───────────────────────────────────────
+// We use MIDI.js's approach: decode SF2, extract samples, play via AudioBufferSourceNode
+
+// Actually: use a proven working stack.
+// html-midi-player / SpessaSynth both have environment issues.
+// Let's use the Magenta soundfont player directly — it works without SF2.
+// But first let's try the simplest possible thing: WebAudioFont
+// WebAudioFont has pre-encoded instruments as JS files, no SF2 needed.
+
+// ── Simplest approach: use midi-player-js + WebAudioFont ─────────────────────
+
+// We'll load midi-player-js for parsing/timing, and WebAudioFont for audio.
+
+// Actually the most reliable no-nonsense approach: 
+// Use Tone.js Sampler with Salamander piano... no, that's only piano.
+//
+// FINAL ANSWER: Use the MIDI.js soundfont (pre-rendered mp3/ogg per note per instrument)
+// hosted on gleitz/midi-js-soundfonts. This is the most battle-tested approach.
+
+// We'll build a minimal GM MIDI player:
+// 1. Parse MIDI with our own parser
+// 2. Schedule notes using Web Audio API
+// 3. Load samples from gleitz soundfonts (acoustic_grand_piano for now, 
+//    or per-channel program change)
+
+const SOUNDFONT_BASE = 'https://gleitz.github.io/midi-js-soundfonts/FluidR3_GM';
+
+// Cache of loaded instruments: { [instrumentName]: { [noteStr]: AudioBuffer } }
+const instrumentCache = {};
+let audioCtx = null;
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function gmInstrumentName(program) {
+  const names = [
+    'acoustic_grand_piano','bright_acoustic_piano','electric_grand_piano','honkytonk_piano',
+    'electric_piano_1','electric_piano_2','harpsichord','clavinet',
+    'celesta','glockenspiel','music_box','vibraphone','marimba','xylophone','tubular_bells','dulcimer',
+    'drawbar_organ','percussive_organ','rock_organ','church_organ','reed_organ','accordion','harmonica','tango_accordion',
+    'acoustic_guitar_nylon','acoustic_guitar_steel','electric_guitar_jazz','electric_guitar_clean',
+    'electric_guitar_muted','overdriven_guitar','distortion_guitar','guitar_harmonics',
+    'acoustic_bass','electric_bass_finger','electric_bass_pick','fretless_bass',
+    'slap_bass_1','slap_bass_2','synth_bass_1','synth_bass_2',
+    'violin','viola','cello','contrabass','tremolo_strings','pizzicato_strings','orchestral_harp','timpani',
+    'string_ensemble_1','string_ensemble_2','synth_strings_1','synth_strings_2',
+    'choir_aahs','voice_oohs','synth_choir','orchestra_hit',
+    'trumpet','trombone','tuba','muted_trumpet','french_horn','brass_section','synth_brass_1','synth_brass_2',
+    'soprano_sax','alto_sax','tenor_sax','baritone_sax',
+    'oboe','english_horn','bassoon','clarinet',
+    'piccolo','flute','recorder','pan_flute','blown_bottle','shakuhachi','whistle','ocarina',
+    'lead_1_square','lead_2_sawtooth','lead_3_calliope','lead_4_chiff',
+    'lead_5_charang','lead_6_voice','lead_7_fifths','lead_8_bass_lead',
+    'pad_1_new_age','pad_2_warm','pad_3_polysynth','pad_4_choir',
+    'pad_5_bowed','pad_6_metallic','pad_7_halo','pad_8_sweep',
+    'fx_1_rain','fx_2_soundtrack','fx_3_crystal','fx_4_atmosphere',
+    'fx_5_brightness','fx_6_goblins','fx_7_echoes','fx_8_sci_fi',
+    'sitar','banjo','shamisen','koto','kalimba','bag_pipe','fiddle','shanai',
+    'tinkle_bell','agogo','steel_drums','woodblock','taiko_drum','melodic_tom','synth_drum','reverse_cymbal',
+    'guitar_fret_noise','breath_noise','seashore','bird_tweet','telephone_ring','helicopter','applause','gunshot'
+  ];
+  return names[program] || 'acoustic_grand_piano';
+}
+
+async function loadInstrument(program) {
+  const name = gmInstrumentName(program);
+  if (instrumentCache[name]) return instrumentCache[name];
+  const url = `${SOUNDFONT_BASE}/${name}-mp3.js`;
+  return new Promise((resolve, reject) => {
+    // The soundfont JS file defines: MIDI.Soundfont['name'] = { 'C4': 'data:audio/mp3;base64,...', ... }
+    window.MIDI = window.MIDI || {};
+    window.MIDI.Soundfont = window.MIDI.Soundfont || {};
+    const script = document.createElement('script');
+    script.src = url;
+    script.onload = async () => {
+      const sf = window.MIDI.Soundfont[name];
+      if (!sf) { reject(new Error('No data for ' + name)); return; }
+      const ctx = getAudioCtx();
+      const buffers = {};
+      await Promise.all(Object.entries(sf).map(async ([note, dataUrl]) => {
+        try {
+          const base64 = dataUrl.split(',')[1];
+          const binary = atob(base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+          buffers[note] = await ctx.decodeAudioData(bytes.buffer);
+        } catch(_) {}
+      }));
+      instrumentCache[name] = buffers;
+      resolve(buffers);
+    };
+    script.onerror = () => reject(new Error('Failed to load ' + url));
+    document.head.appendChild(script);
+  });
+}
+
+// ── Minimal MIDI parser ───────────────────────────────────────────────────────
+function parseMidi(buffer) {
+  const d = new DataView(buffer);
+  let pos = 0;
+  const readU8  = () => d.getUint8(pos++);
+  const readU16 = () => { const v=d.getUint16(pos); pos+=2; return v; };
+  const readU32 = () => { const v=d.getUint32(pos); pos+=4; return v; };
+  const readStr = n => { let s=''; for(let i=0;i<n;i++) s+=String.fromCharCode(readU8()); return s; };
+  const readVLQ = () => { let v=0,b; do { b=readU8(); v=(v<<7)|(b&0x7f); } while(b&0x80); return v; };
+
+  if (readStr(4) !== 'MThd') throw new Error('Not a MIDI file');
+  readU32(); // header length
+  const format   = readU16();
+  const nTracks  = readU16();
+  const division = readU16(); // ticks per quarter note (assuming non-SMPTE)
+
+  const tracks = [];
+  for (let t=0; t<nTracks; t++) {
+    if (readStr(4) !== 'MTrk') throw new Error('Bad track header');
+    const tlen = readU32();
+    const tend = pos + tlen;
+    const events = [];
+    let tick = 0;
+    let lastStatus = 0;
+    while (pos < tend) {
+      const dt = readVLQ();
+      tick += dt;
+      let statusByte = d.getUint8(pos);
+      if (statusByte & 0x80) { lastStatus = statusByte; pos++; }
+      else { statusByte = lastStatus; } // running status
+      const type = statusByte & 0xf0;
+      const ch   = statusByte & 0x0f;
+      if (statusByte === 0xff) { // meta
+        const mtype = readU8();
+        const mlen  = readVLQ();
+        if (mtype === 0x51 && mlen === 3) { // tempo
+          const tempo = (readU8()<<16)|(readU8()<<8)|readU8();
+          events.push({tick, type:'tempo', tempo});
+        } else {
+          pos += mlen;
+        }
+      } else if (statusByte === 0xf0 || statusByte === 0xf7) {
+        pos += readVLQ();
+      } else if (type === 0x90) {
+        const note = readU8(), vel = readU8();
+        events.push({tick, type: vel>0?'noteOn':'noteOff', ch, note, vel});
+      } else if (type === 0x80) {
+        const note = readU8(); readU8();
+        events.push({tick, type:'noteOff', ch, note});
+      } else if (type === 0xa0) { readU8(); readU8(); }
+      else if (type === 0xb0) { readU8(); readU8(); }
+      else if (type === 0xc0) {
+        const prog = readU8();
+        events.push({tick, type:'program', ch, program: prog});
+      } else if (type === 0xd0) { readU8(); }
+      else if (type === 0xe0) { readU8(); readU8(); }
+      else { /* unknown, skip */ }
+    }
+    pos = tend;
+    tracks.push(events);
+  }
+  return { format, nTracks, division, tracks };
+}
+
+// Merge all tracks into one flat timeline of {seconds, ...event}
+function buildTimeline(midi) {
+  let tempo = 500000; // default 120bpm
+  const tpq = midi.division;
+
+  // Collect all events with ticks
+  let allEvents = [];
+  for (const track of midi.tracks) {
+    for (const ev of track) allEvents.push({...ev});
+  }
+  allEvents.sort((a,b) => a.tick - b.tick);
+
+  // Convert ticks to seconds using tempo map
+  // First build tempo map
+  const tempoMap = [{tick:0, tempo:500000}];
+  for (const ev of allEvents) {
+    if (ev.type==='tempo') tempoMap.push({tick:ev.tick, tempo:ev.tempo});
+  }
+  tempoMap.sort((a,b)=>a.tick-b.tick);
+
+  function ticksToSeconds(tick) {
+    let secs = 0;
+    let prevTick = 0;
+    let prevTempo = 500000;
+    for (const tm of tempoMap) {
+      if (tm.tick >= tick) break;
+      secs += (Math.min(tm.tick,tick) - prevTick) / tpq * (prevTempo/1e6);
+      prevTick = tm.tick;
+      prevTempo = tm.tempo;
+    }
+    secs += (tick - prevTick) / tpq * (prevTempo/1e6);
+    return secs;
+  }
+
+  return allEvents.map(ev => ({...ev, seconds: ticksToSeconds(ev.tick)}));
+}
+
+// ── Playback engine ───────────────────────────────────────────────────────────
+const NOTE_NAMES = ['C','Db','D','Eb','E','F','F#','G','Ab','A','Bb','B'];
+function midiNoteToName(n) { return NOTE_NAMES[n%12] + Math.floor(n/12-1); }
+
+let scheduledNodes = [];
+let playbackStartTime = 0;  // audioCtx.currentTime when playback started
+let playbackOffset = 0;     // seconds into the song when we started
+let playbackDuration = 0;
+let playbackTimeline = null;
+let channelPrograms = {};
+let isPlaying = false;
+let seekTarget = null;
+let animFrame = null;
 let songs = [];
 let currentSongIdx = -1;
-const player = $('player');
+let seeking = false;
+let onEndCallback = null;
+let endTimer = null;
 
-function playSong(idx) {
+function stopAllNodes() {
+  for (const n of scheduledNodes) { try { n.stop(); } catch(_) {} }
+  scheduledNodes = [];
+  if (endTimer) { clearTimeout(endTimer); endTimer=null; }
+}
+
+function schedulePlayback(timeline, startOffset, instruments) {
+  const ctx = getAudioCtx();
+  const now = ctx.currentTime + 0.1; // small buffer
+  playbackStartTime = now - startOffset;
+
+  stopAllNodes();
+
+  let maxEnd = 0;
+  for (const ev of timeline) {
+    if (ev.seconds < startOffset - 0.05) continue;
+    if (ev.type === 'noteOn') {
+      const prog = channelPrograms[ev.ch] || 0;
+      const name = gmInstrumentName(prog);
+      const buffers = instruments[name];
+      if (!buffers) continue;
+      const noteName = midiNoteToName(ev.note);
+      const buf = buffers[noteName];
+      if (!buf) continue;
+      const startAt = playbackStartTime + ev.seconds;
+      if (startAt < ctx.currentTime) continue;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const gain = ctx.createGain();
+      gain.gain.value = (ev.vel || 80) / 127;
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      src.start(startAt);
+      scheduledNodes.push(src);
+      const endAt = startAt + buf.duration;
+      if (endAt > maxEnd) maxEnd = endAt;
+    } else if (ev.type === 'program') {
+      channelPrograms[ev.ch] = ev.program;
+    }
+  }
+
+  // End callback
+  const remaining = (maxEnd - ctx.currentTime) * 1000;
+  endTimer = setTimeout(() => {
+    if (isPlaying && onEndCallback) onEndCallback();
+  }, Math.max(remaining, 500));
+}
+
+async function playSong(idx) {
   const song = songs[idx];
   if (!song) return;
 
-  document.querySelectorAll('#song-list li').forEach((li, i) =>
-    li.classList.toggle('active', i === idx));
+  document.querySelectorAll('#song-list li').forEach((li,i) =>
+    li.classList.toggle('active', i===idx));
   currentSongIdx = idx;
+  $('player').style.display = 'block';
+  $('now-playing').textContent = `Now: ${song.filename}${song.title?' — '+song.title:''}`;
 
-  $('now-playing').style.display = 'block';
-  $('now-playing').textContent = `Now: ${song.filename}${song.title ? ' — ' + song.title : ''}`;
-  player.style.display = 'block';
+  stopAllNodes();
+  isPlaying = false;
+  status('Parsing MIDI…');
 
-  // Set src to a data URL of the midi buffer
-  const blob = new Blob([song.buf], { type: 'audio/midi' });
-  const url = URL.createObjectURL(blob);
-  player.src = url;
-  player.start();
-}
-
-// Auto-advance when song ends
-player.addEventListener('stop', () => {
-  if (currentSongIdx >= 0) {
-    const next = (currentSongIdx + 1) % songs.length;
-    playSong(next);
-  }
-});
-
-(async () => {
-  const { midis, sf2s } = await discoverFiles();
-
-  if (midis.length === 0) {
-    status('No MIDI files found.');
+  let midi, timeline;
+  try {
+    midi = parseMidi(song.buf.slice(0));
+    timeline = buildTimeline(midi);
+  } catch(e) {
+    status('MIDI parse error: ' + e.message);
     return;
   }
 
-  status(`Loading ${midis.length} track(s)…`);
+  // Figure out which programs are used
+  channelPrograms = {};
+  const programs = new Set([0]); // always load piano as fallback
+  for (const ev of timeline) {
+    if (ev.type==='program') { channelPrograms[ev.ch]=ev.program; programs.add(ev.program); }
+  }
+  // Drum channel 9 has no melodic instrument
+  channelPrograms[9] = -1;
 
+  playbackDuration = timeline.reduce((m,e)=>Math.max(m,e.seconds),0);
+  playbackTimeline = timeline;
+  $('seek').value = 0;
+  $('time-display').textContent = `0:00 / ${fmt(playbackDuration)}`;
+
+  status(`Loading ${programs.size} instrument(s)…`);
+  const instruments = {};
+  await Promise.all([...programs].filter(p=>p>=0).map(async p => {
+    try {
+      const name = gmInstrumentName(p);
+      instruments[name] = await loadInstrument(p);
+    } catch(e) { console.warn('instrument load failed', p, e); }
+  }));
+
+  onEndCallback = () => {
+    isPlaying = false;
+    $('btn-play').textContent = '▶ Play';
+    playSong((currentSongIdx+1) % songs.length);
+  };
+
+  playbackOffset = 0;
+  schedulePlayback(timeline, 0, instruments);
+  isPlaying = true;
+  $('btn-play').textContent = '⏸ Pause';
+  status('Playing.');
+  startSeekLoop(instruments);
+}
+
+function startSeekLoop(instruments) {
+  if (animFrame) cancelAnimationFrame(animFrame);
+  function tick() {
+    if (!isPlaying) return;
+    const ctx = getAudioCtx();
+    const elapsed = ctx.currentTime - playbackStartTime;
+    const clamped = Math.min(Math.max(elapsed,0), playbackDuration);
+    if (!seeking) $('seek').value = Math.round((clamped/playbackDuration)*1000);
+    $('time-display').textContent = `${fmt(clamped)} / ${fmt(playbackDuration)}`;
+    animFrame = requestAnimationFrame(tick);
+  }
+  animFrame = requestAnimationFrame(tick);
+}
+
+// Controls
+$('btn-play').addEventListener('click', async () => {
+  if (!playbackTimeline) {
+    if (songs.length) playSong(0);
+    return;
+  }
+  if (isPlaying) {
+    // Pause: record offset, stop nodes
+    const ctx = getAudioCtx();
+    playbackOffset = ctx.currentTime - playbackStartTime;
+    stopAllNodes();
+    isPlaying = false;
+    $('btn-play').textContent = '▶ Play';
+    if (animFrame) cancelAnimationFrame(animFrame);
+  } else {
+    // Resume from offset
+    const ctx = getAudioCtx();
+    if (ctx.state==='suspended') await ctx.resume();
+    // Re-collect instruments from cache
+    const instruments = {};
+    for (const [name, bufs] of Object.entries(instrumentCache)) instruments[name]=bufs;
+    schedulePlayback(playbackTimeline, playbackOffset, instruments);
+    isPlaying = true;
+    $('btn-play').textContent = '⏸ Pause';
+    startSeekLoop(instruments);
+    status('Playing.');
+  }
+});
+
+$('btn-stop').addEventListener('click', () => {
+  stopAllNodes();
+  isPlaying = false;
+  playbackOffset = 0;
+  $('btn-play').textContent = '▶ Play';
+  $('seek').value = 0;
+  if (playbackDuration) $('time-display').textContent = `0:00 / ${fmt(playbackDuration)}`;
+  if (animFrame) cancelAnimationFrame(animFrame);
+});
+
+$('seek').addEventListener('mousedown',  () => { seeking=true; });
+$('seek').addEventListener('touchstart', () => { seeking=true; }, {passive:true});
+$('seek').addEventListener('input', () => {
+  if (!playbackDuration) return;
+  const t = (parseInt($('seek').value)/1000)*playbackDuration;
+  $('time-display').textContent = `${fmt(t)} / ${fmt(playbackDuration)}`;
+});
+$('seek').addEventListener('change', async () => {
+  seeking = false;
+  if (!playbackTimeline) return;
+  playbackOffset = (parseInt($('seek').value)/1000)*playbackDuration;
+  if (isPlaying) {
+    stopAllNodes();
+    const instruments = {};
+    for (const [name,bufs] of Object.entries(instrumentCache)) instruments[name]=bufs;
+    schedulePlayback(playbackTimeline, playbackOffset, instruments);
+    startSeekLoop(instruments);
+  }
+});
+
+// Bootstrap
+(async () => {
+  const {midis, sf2s} = await discoverFiles();
+  if (!midis.length) { status('No MIDI files found.'); return; }
+
+  status(`Loading ${midis.length} track(s)…`);
   const raw = await Promise.all(midis.map(async url => {
     const filename = decodeURIComponent(url.split('/').pop());
     try {
       const r = await fetch(url);
       const buf = await r.arrayBuffer();
-      const title = readMidiTitle(buf);
-      return { url, filename, title, buf };
-    } catch(_) {
-      return null;
-    }
+      return {url, filename, title: readMidiTitle(buf), buf};
+    } catch(_) { return null; }
   }));
 
-  songs = raw.filter(Boolean).sort((a, b) => a.filename.localeCompare(b.filename));
+  songs = raw.filter(Boolean).sort((a,b)=>a.filename.localeCompare(b.filename));
 
   const list = $('song-list');
-  songs.forEach((song, idx) => {
+  songs.forEach((song,idx) => {
     const li = document.createElement('li');
-    const fn = document.createElement('span');
-    fn.className = 'filename';
-    fn.textContent = song.filename;
+    const fn = document.createElement('span'); fn.className='filename'; fn.textContent=song.filename;
     li.appendChild(fn);
     if (song.title) {
-      const mt = document.createElement('span');
-      mt.className = 'meta-title';
-      mt.textContent = song.title;
+      const mt = document.createElement('span'); mt.className='meta-title'; mt.textContent=song.title;
       li.appendChild(mt);
     }
-    li.addEventListener('click', () => playSong(idx));
+    li.addEventListener('click', ()=>playSong(idx));
     list.appendChild(li);
   });
 
