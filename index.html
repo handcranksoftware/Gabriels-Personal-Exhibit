@@ -166,6 +166,7 @@ async function discoverFiles() {
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let ctx, synth, sequencer;
+let workletReady = false;
 let songs = [];
 let currentSF2Buf = null;
 let currentSongIdx = -1;
@@ -198,6 +199,7 @@ async function playSong(idx) {
   // Create / resume AudioContext (must happen inside user gesture)
   if (!ctx) {
     ctx = new AudioContext({ sampleRate: 44100 });
+    workletReady = false;
   }
   if (ctx.state === 'suspended') await ctx.resume();
 
@@ -205,15 +207,23 @@ async function playSong(idx) {
   if (sequencer) { try { sequencer.pause(); } catch(_) {} }
   if (synth)     { try { synth.stopAll(true); } catch(_) {} }
 
-  status('Fetching MIDI…');
-  const mr = await fetch(song.url);
-  if (!mr.ok) { status('Could not load MIDI: ' + song.filename); return; }
-  const midiBuf = await mr.arrayBuffer();
+  // Use already-fetched buffer; fall back to re-fetching if missing
+  let midiBuf = song.buf;
+  if (!midiBuf) {
+    status('Fetching MIDI…');
+    const mr = await fetch(song.url);
+    if (!mr.ok) { status('Could not load MIDI: ' + song.filename); return; }
+    midiBuf = await mr.arrayBuffer();
+    song.buf = midiBuf;
+  }
 
   status('Starting synth…');
 
-  // WorkletSynthesizer needs the audio worklet module loaded first
-  await ctx.audioWorklet.addModule(PROCESSOR_URL);
+  // WorkletSynthesizer needs the audio worklet module loaded first (only once per context)
+  if (!workletReady) {
+    await ctx.audioWorklet.addModule(PROCESSOR_URL);
+    workletReady = true;
+  }
 
   synth = new WorkletSynthesizer(ctx, PROCESSOR_URL, { reverbEnabled: false });
   await synth.isReady;
