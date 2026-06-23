@@ -55,104 +55,49 @@
   <div id="time-display">0:00 / 0:00</div>
 </div>
 
-<!--
-  SpessaSynth is a pure JS MIDI + SF2 player.
-  We load it from the official CDN release.
--->
 <script type="module">
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 const $ = id => document.getElementById(id);
 const status = msg => { $('status').textContent = msg; };
-const fmt = s => { s = Math.floor(s); return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; };
+const fmt = s => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; };
 
-// ── Discover assets via GitHub Pages directory listing ────────────────────────
-// GitHub Pages serves an HTML directory index at the repo root.
-// We fetch it and parse anchor hrefs for .mid/.midi/.sf2 files.
-// Works for both user.github.io/repo/ and custom domains.
-
-async function discoverFiles() {
-  // The assets folder we look in — change this if you put files elsewhere
-  const base = location.href.replace(/\/?$/, '/');
-  let html = '';
-  try {
-    const r = await fetch(base);
-    html = await r.text();
-  } catch(e) {
-    status('Could not fetch directory listing.');
-    return { midis: [], sf2s: [] };
-  }
-
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, 'text/html');
-  const hrefs = [...doc.querySelectorAll('a[href]')].map(a => a.getAttribute('href'));
-
-  const midis = hrefs.filter(h => /\.(mid|midi)$/i.test(h)).map(h => new URL(h, base).href);
-  const sf2s  = hrefs.filter(h => /\.sf2$/i.test(h)).map(h => new URL(h, base).href);
-
-  // Fallback: if GH Pages doesn't list dirs, try fetching a manifest.json
-  if (midis.length === 0 && sf2s.length === 0) {
-    try {
-      const mfr = await fetch(base + 'manifest.json');
-      if (mfr.ok) {
-        const mf = await mfr.json();
-        return {
-          midis: (mf.midis||[]).map(f => base + f),
-          sf2s:  (mf.sf2s ||[]).map(f => base + f),
-        };
-      }
-    } catch(_) {}
-  }
-
-  return { midis, sf2s };
-}
-
-// ── Read MIDI text meta (type 3 = track name / sequence name) ────────────────
+// ── Read MIDI text meta (type 3 = track/sequence name) ───────────────────────
 
 function readMidiTitle(buffer) {
   const b = new Uint8Array(buffer);
   let i = 0;
   const read = () => b[i++];
   const readU32 = () => (read()<<24)|(read()<<16)|(read()<<8)|read();
-  const readVLQ = () => {
-    let v = 0, c;
-    do { c = read(); v = (v<<7)|(c&0x7f); } while (c&0x80);
-    return v;
-  };
-
+  const readVLQ = () => { let v=0,c; do { c=read(); v=(v<<7)|(c&0x7f); } while(c&0x80); return v; };
   try {
     if (String.fromCharCode(b[0],b[1],b[2],b[3]) !== 'MThd') return null;
-    i = 8; // skip MThd length+format+ntracks+division header fields we don't need right now
-    readU32(); // length (always 6)
+    i = 4; readU32(); // chunk length
     const format = (b[i]<<8)|b[i+1]; i+=2;
     const ntracks = (b[i]<<8)|b[i+1]; i+=2;
     i += 2; // division
-
-    // search first few tracks for sequence/track name event (meta 0x03)
-    const tracksToSearch = Math.min(ntracks, 3);
-    for (let t = 0; t < tracksToSearch; t++) {
+    for (let t = 0; t < Math.min(ntracks, 3); t++) {
+      if (i+8 > b.length) break;
       if (String.fromCharCode(b[i],b[i+1],b[i+2],b[i+3]) !== 'MTrk') break;
       i += 4;
       const tlen = readU32();
       const tend = i + tlen;
-      while (i < tend) {
-        readVLQ(); // delta time
+      while (i < tend - 1) {
+        readVLQ();
         const evt = read();
         if (evt === 0xff) {
           const mtype = read();
           const mlen = readVLQ();
-          if (mtype === 0x03) { // Sequence/Track Name
-            const bytes = b.slice(i, i+mlen);
-            return new TextDecoder('utf-8', {fatal:false}).decode(bytes).trim();
+          if (mtype === 0x03) {
+            return new TextDecoder('utf-8', {fatal:false}).decode(b.slice(i, i+mlen)).trim();
           }
           i += mlen;
         } else if (evt === 0xf0 || evt === 0xf7) {
           i += readVLQ();
         } else {
-          // skip status + data bytes
           const ch = evt & 0xf0;
           if (ch === 0xc0 || ch === 0xd0) i += 1;
-          else if (ch === 0xf0) { /* nothing */ }
+          else if (evt < 0x80) { /* running status, skip 1 */ i += 1; }
           else i += 2;
         }
       }
@@ -162,40 +107,66 @@ function readMidiTitle(buffer) {
   return null;
 }
 
-// ── Load SpessaSynth dynamically ──────────────────────────────────────────────
-// SpessaSynth exposes MIDI_PLAYER and SYNTHETIZER via ESM
+// ── Load SpessaSynth v4 ───────────────────────────────────────────────────────
+// v4 API: WorkletSynthesizer + Sequencer (replaces Synthetizer/MIDI/MidiPlayer)
+// The worklet processor must be registered before creating WorkletSynthesizer.
 
-let Synthetizer, MIDI, MidiPlayer;
+const SPESSA_VERSION = '4.3.8';
+const JSDELIVR_BASE  = `https://cdn.jsdelivr.net/npm/spessasynth_lib@${SPESSA_VERSION}`;
+const PROCESSOR_URL  = `${JSDELIVR_BASE}/dist/spessasynth_processor.min.js`;
+const ESM_URL        = `https://esm.run/spessasynth_lib@${SPESSA_VERSION}`;
+
+let WorkletSynthesizer, Sequencer;
 
 async function loadSpessa() {
   status('Loading MIDI engine…');
   try {
-    // SpessaSynth ESM bundle on jsDelivr (stable release)
-    const mod = await import('https://cdn.jsdelivr.net/npm/spessasynth_lib@3/src/spessasynth_lib/index.js');
-    Synthetizer = mod.Synthetizer;
-    MIDI = mod.MIDI;
-    MidiPlayer = mod.MidiPlayer;
+    const mod = await import(ESM_URL);
+    WorkletSynthesizer = mod.WorkletSynthesizer;
+    Sequencer          = mod.Sequencer;
+    if (!WorkletSynthesizer || !Sequencer) throw new Error('Exports not found');
     return true;
   } catch(e) {
-    // Try unpkg as fallback
-    try {
-      const mod2 = await import('https://unpkg.com/spessasynth_lib/src/spessasynth_lib/index.js');
-      Synthetizer = mod2.Synthetizer;
-      MIDI = mod2.MIDI;
-      MidiPlayer = mod2.MidiPlayer;
-      return true;
-    } catch(e2) {
-      status('Failed to load MIDI engine: ' + e2.message);
-      return false;
-    }
+    status('Failed to load MIDI engine: ' + e.message);
+    return false;
   }
+}
+
+// ── Discover files ────────────────────────────────────────────────────────────
+
+async function discoverFiles() {
+  const base = location.href.replace(/\/?(\?.*)?$/, '/');
+
+  // 1. Try manifest.json (works on GitHub Pages where dir listing is off)
+  try {
+    const r = await fetch(base + 'manifest.json');
+    if (r.ok) {
+      const mf = await r.json();
+      const midis = (mf.midis || []).map(e => base + (typeof e === 'string' ? e : e.file));
+      const sf2s  = (mf.sf2s  || []).map(e => base + (typeof e === 'string' ? e : e.file));
+      if (midis.length || sf2s.length) return { midis, sf2s };
+    }
+  } catch(_) {}
+
+  // 2. Try HTML directory listing
+  try {
+    const r = await fetch(base);
+    const html = await r.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const hrefs = [...doc.querySelectorAll('a[href]')].map(a => a.getAttribute('href'));
+    return {
+      midis: hrefs.filter(h => /\.(mid|midi)$/i.test(h)).map(h => new URL(h, base).href),
+      sf2s:  hrefs.filter(h => /\.sf2$/i.test(h)).map(h => new URL(h, base).href),
+    };
+  } catch(_) {}
+
+  return { midis: [], sf2s: [] };
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let ctx, synth, player;
-let songs = []; // {url, filename, title}
-let sf2s  = []; // urls
+let ctx, synth, sequencer;
+let songs = [];
 let currentSF2Buf = null;
 let currentSongIdx = -1;
 let seeking = false;
@@ -216,55 +187,74 @@ async function playSong(idx) {
   const song = songs[idx];
   if (!song) return;
 
-  // highlight
-  document.querySelectorAll('#song-list li').forEach((li,i) => li.classList.toggle('active', i===idx));
+  document.querySelectorAll('#song-list li').forEach((li, i) =>
+    li.classList.toggle('active', i === idx));
   currentSongIdx = idx;
 
   $('player').style.display = 'block';
-  $('now-playing').textContent = `Now: ${song.filename}${song.title ? ' — ' + song.title : ''}`;
+  $('now-playing').textContent =
+    `Now: ${song.filename}${song.title ? ' — ' + song.title : ''}`;
 
+  // Create / resume AudioContext (must happen inside user gesture)
   if (!ctx) {
-    ctx = new AudioContext();
+    ctx = new AudioContext({ sampleRate: 44100 });
   }
   if (ctx.state === 'suspended') await ctx.resume();
 
-  // stop previous
-  if (player) { try { player.stop(); } catch(_) {} }
-  if (synth)  { try { synth.stopAll(); } catch(_) {} }
+  // Stop previous playback
+  if (sequencer) { try { sequencer.pause(); } catch(_) {} }
+  if (synth)     { try { synth.stopAll(true); } catch(_) {} }
 
   status('Fetching MIDI…');
   const mr = await fetch(song.url);
+  if (!mr.ok) { status('Could not load MIDI: ' + song.filename); return; }
   const midiBuf = await mr.arrayBuffer();
 
-  status('Synthesizing…');
-  synth = new Synthetizer(ctx.destination, currentSF2Buf);
-  const midiObj = new MIDI(midiBuf, '');
-  player = new MidiPlayer(midiObj, ctx, synth);
+  status('Starting synth…');
 
-  player.play();
+  // WorkletSynthesizer needs the audio worklet module loaded first
+  await ctx.audioWorklet.addModule(PROCESSOR_URL);
+
+  synth = new WorkletSynthesizer(ctx, PROCESSOR_URL, { reverbEnabled: false });
+  await synth.isReady;
+
+  // Add the soundfont
+  await synth.soundfontManager.addSoundFont(currentSF2Buf.slice(0), 'default');
+
+  // Create sequencer and load song
+  sequencer = new Sequencer([{ binary: midiBuf }], synth);
+
+  sequencer.play();
   $('btn-play').textContent = '⏸ Pause';
   status('Playing.');
+
+  // Auto-advance when song ends
+  sequencer.addOnSongEndedEvent(() => {
+    const next = (currentSongIdx + 1) % songs.length;
+    playSong(next);
+  }, 'auto-advance');
+
   updateSeekLoop();
 }
 
 // ── Seek / time display ───────────────────────────────────────────────────────
 
 function updateSeekLoop() {
-  const seek = $('seek');
-  const timeDisplay = $('time-display');
+  const seekEl = $('seek');
+  const timeEl = $('time-display');
+
   function tick() {
-    if (!player) return;
-    const dur = player.duration;
-    const cur = player.currentTime;
+    if (!sequencer) return;
+    const cur = sequencer.currentTime;        // seconds
+    const dur = sequencer.duration;           // seconds
+
     if (dur > 0 && !seeking) {
-      seek.value = Math.round((cur / dur) * 1000);
+      seekEl.value = Math.round((cur / dur) * 1000);
     }
-    timeDisplay.textContent = `${fmt(cur)} / ${fmt(dur)}`;
-    if (!player.paused) requestAnimationFrame(tick);
-    else if (cur >= dur - 0.1 && dur > 0) {
-      // auto-advance
-      const next = (currentSongIdx + 1) % songs.length;
-      playSong(next);
+    timeEl.textContent = `${fmt(cur)} / ${fmt(dur)}`;
+
+    if (!sequencer.paused) {
+      requestAnimationFrame(tick);
     }
   }
   requestAnimationFrame(tick);
@@ -273,42 +263,43 @@ function updateSeekLoop() {
 // ── Controls ──────────────────────────────────────────────────────────────────
 
 $('btn-play').addEventListener('click', () => {
-  if (!player) return;
-  if (player.paused) {
-    player.play();
+  if (!sequencer) return;
+  if (sequencer.paused) {
+    sequencer.play();
     $('btn-play').textContent = '⏸ Pause';
     updateSeekLoop();
   } else {
-    player.pause();
+    sequencer.pause();
     $('btn-play').textContent = '▶ Play';
   }
 });
 
 $('btn-stop').addEventListener('click', () => {
-  if (player) { player.stop(); $('btn-play').textContent = '▶ Play'; }
+  if (!sequencer) return;
+  sequencer.pause();
+  sequencer.currentTime = 0;
+  $('btn-play').textContent = '▶ Play';
+  $('seek').value = 0;
 });
 
-$('seek').addEventListener('mousedown', () => { seeking = true; });
-$('seek').addEventListener('touchstart', () => { seeking = true; });
+$('seek').addEventListener('mousedown',  () => { seeking = true; });
+$('seek').addEventListener('touchstart', () => { seeking = true; }, { passive: true });
 $('seek').addEventListener('input', () => {
-  if (!player) return;
-  const t = (parseInt($('seek').value) / 1000) * player.duration;
-  $('time-display').textContent = `${fmt(t)} / ${fmt(player.duration)}`;
+  if (!sequencer) return;
+  const t = (parseInt($('seek').value) / 1000) * sequencer.duration;
+  $('time-display').textContent = `${fmt(t)} / ${fmt(sequencer.duration)}`;
 });
 $('seek').addEventListener('change', () => {
-  if (!player) return;
-  const t = (parseInt($('seek').value) / 1000) * player.duration;
-  player.currentTime = t;
+  if (!sequencer) return;
+  sequencer.currentTime = (parseInt($('seek').value) / 1000) * sequencer.duration;
   seeking = false;
-  if (!player.paused) updateSeekLoop();
+  if (!sequencer.paused) updateSeekLoop();
 });
 
 // ── SF2 switcher ──────────────────────────────────────────────────────────────
 
 $('sf2-select').addEventListener('change', async () => {
-  const url = $('sf2-select').value;
-  await loadSF2(url);
-  // reload current song with new SF2
+  await loadSF2($('sf2-select').value);
   if (currentSongIdx >= 0) playSong(currentSongIdx);
 });
 
@@ -318,15 +309,13 @@ $('sf2-select').addEventListener('change', async () => {
   const ok = await loadSpessa();
   if (!ok) return;
 
-  const { midis, sf2s: sf2urls } = await discoverFiles();
-  sf2s = sf2urls;
+  const { midis, sf2s } = await discoverFiles();
 
   if (sf2s.length === 0) {
-    status('No .sf2 soundfont files found in this directory. Add one and reload.');
+    status('No .sf2 soundfont files found. Add one and reload.');
     return;
   }
 
-  // SF2 picker: only show if multiple
   if (sf2s.length > 1) {
     const sel = $('sf2-select');
     sf2s.forEach(url => {
@@ -338,7 +327,6 @@ $('sf2-select').addEventListener('change', async () => {
     $('sf2-section').style.display = 'block';
   }
 
-  // Load the first SF2
   await loadSF2(sf2s[0]);
 
   if (midis.length === 0) {
@@ -346,9 +334,7 @@ $('sf2-select').addEventListener('change', async () => {
     return;
   }
 
-  // Fetch + parse metadata for each MIDI
   status(`Reading ${midis.length} MIDI file(s)…`);
-  const list = $('song-list');
 
   await Promise.all(midis.map(async (url, idx) => {
     const filename = decodeURIComponent(url.split('/').pop());
@@ -357,13 +343,16 @@ $('sf2-select').addEventListener('change', async () => {
       const r = await fetch(url);
       const buf = await r.arrayBuffer();
       title = readMidiTitle(buf);
-    } catch(_) {}
-    songs[idx] = { url, filename, title };
+      songs[idx] = { url, filename, title, buf };
+    } catch(_) {
+      songs[idx] = { url, filename, title: null, buf: null };
+    }
   }));
 
-  // sort alphabetically by filename
-  songs.sort((a,b) => a.filename.localeCompare(b.filename));
+  songs = songs.filter(Boolean);
+  songs.sort((a, b) => a.filename.localeCompare(b.filename));
 
+  const list = $('song-list');
   songs.forEach((song, idx) => {
     const li = document.createElement('li');
     const fn = document.createElement('span');
