@@ -1,7 +1,5 @@
 {
   "tracks": [
-    { "file": "D_CLUSTR.wav", "title": "Untitled 1" },
-    { "file": "D_MOT1F.wav",  "title": null },
     { "file": "D_STG001.wav", "title": "Low & Behold" },
     { "file": "D_STG002.wav", "title": "Deep Issue" },
     { "file": "D_STG003.wav", "title": "Subterranean Passage" },
@@ -11,7 +9,6 @@
     { "file": "D_STG007.wav", "title": "Quick Thinking" },
     { "file": "D_STG008.wav", "title": "Under New Management" },
     { "file": "D_STG009.wav", "title": "Tacticality" },
-    { "file": "D_TESTER.wav", "title": "Untitled 2" },
     { "file": "D_TITLE.wav",  "title": "Entry Accepted" },
     { "file": "D_WINNER.mp3", "title": "Between Sectors" }
   ]
