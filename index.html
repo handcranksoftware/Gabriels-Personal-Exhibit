@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gabriel's Music!</title>
+
+<!-- Discord / OG embed -->
+<meta property="og:title" content="Gabriel's Music!">
+<meta property="og:description" content="Gabriel's Music!">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#5865F2">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Gabriel's Music!">
+<meta name="twitter:description" content="Gabriel's Music!">
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; font-size: 14px; padding: 16px; background: #fff; color: #000; }
+  h1 { font-size: 16px; font-weight: bold; margin-bottom: 12px; }
+  #status { margin-bottom: 8px; color: #555; }
+  #song-list { list-style: none; margin-bottom: 16px; }
+  #song-list li { padding: 4px 0; cursor: pointer; border-bottom: 1px solid #ddd; }
+  #song-list li:hover { background: #f0f0f0; }
+  #song-list li.active { background: #e8e8e8; font-weight: bold; }
+  #song-list li .filename { display: block; }
+  #song-list li .meta-title { display: block; color: #555; font-size: 12px; }
+  #player { border-top: 2px solid #000; padding-top: 10px; }
+  #now-playing { margin-bottom: 6px; font-weight: bold; }
+  #controls { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  #controls button { font-family: monospace; cursor: pointer; }
+  #seek { width: 100%; cursor: pointer; }
+  #time-display { font-size: 12px; color: #555; }
+</style>
+</head>
+<body>
+
+<h1>Gabriel's Music!</h1>
+<div id="status">Loading…</div>
+<ul id="song-list"></ul>
+
+<div id="player" style="display:none">
+  <div id="now-playing">—</div>
+  <div id="controls">
+    <button id="btn-play">▶ Play</button>
+    <button id="btn-stop">■ Stop</button>
+  </div>
+  <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+  <div id="time-display">0:00 / 0:00</div>
+</div>
+
+<script>
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+const status = msg => { $('status').textContent = msg; };
+const fmt = s => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; };
+
+// ── Discover audio files ──────────────────────────────────────────────────────
+
+async function discoverFiles() {
+  const base = location.href.replace(/\/?(\?.*)?$/, '/');
+
+  // 1. Try manifest.json
+  try {
+    const r = await fetch(base + 'manifest.json');
+    if (r.ok) {
+      const mf = await r.json();
+      const tracks = (mf.tracks || []).map(e => ({
+        url: base + (typeof e === 'string' ? e : e.file),
+        title: (typeof e === 'object' && e.title) ? e.title : null,
+        filename: decodeURIComponent((typeof e === 'string' ? e : e.file).split('/').pop()),
+      }));
+      if (tracks.length) return tracks;
+    }
+  } catch(_) {}
+
+  // 2. Try HTML directory listing
+  try {
+    const r = await fetch(base);
+    const html = await r.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const hrefs = [...doc.querySelectorAll('a[href]')].map(a => a.getAttribute('href'));
+    return hrefs
+      .filter(h => /\.(wav|mp3|ogg|flac|aac|m4a)$/i.test(h))
+      .map(h => {
+        const url = new URL(h, base).href;
+        return { url, title: null, filename: decodeURIComponent(url.split('/').pop()) };
+      });
+  } catch(_) {}
+
+  return [];
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+let audio = new Audio();
+let songs = [];
+let currentSongIdx = -1;
+let seeking = false;
+let seekRaf = null;
+
+// ── Play a song ───────────────────────────────────────────────────────────────
+
+function playSong(idx) {
+  const song = songs[idx];
+  if (!song) return;
+
+  document.querySelectorAll('#song-list li').forEach((li, i) =>
+    li.classList.toggle('active', i === idx));
+  currentSongIdx = idx;
+
+  $('player').style.display = 'block';
+  $('now-playing').textContent =
+    `Now: ${song.filename}${song.title ? ' — ' + song.title : ''}`;
+
+  audio.pause();
+  audio.src = song.url;
+  audio.currentTime = 0;
+  audio.play().then(() => {
+    $('btn-play').textContent = '⏸ Pause';
+    status('Playing.');
+    startSeekLoop();
+  }).catch(e => {
+    status('Playback error: ' + e.message);
+  });
+}
+
+// ── Seek / time display ───────────────────────────────────────────────────────
+
+function startSeekLoop() {
+  if (seekRaf) cancelAnimationFrame(seekRaf);
+  function tick() {
+    if (!seeking && audio.duration > 0) {
+      $('seek').value = Math.round((audio.currentTime / audio.duration) * 1000);
+    }
+    $('time-display').textContent = `${fmt(audio.currentTime)} / ${fmt(audio.duration || 0)}`;
+    if (!audio.paused) {
+      seekRaf = requestAnimationFrame(tick);
+    }
+  }
+  seekRaf = requestAnimationFrame(tick);
+}
+
+// ── Audio events ──────────────────────────────────────────────────────────────
+
+audio.addEventListener('ended', () => {
+  const next = (currentSongIdx + 1) % songs.length;
+  playSong(next);
+});
+
+audio.addEventListener('pause', () => {
+  $('btn-play').textContent = '▶ Play';
+});
+
+audio.addEventListener('play', () => {
+  $('btn-play').textContent = '⏸ Pause';
+});
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+
+$('btn-play').addEventListener('click', () => {
+  if (currentSongIdx < 0) return;
+  if (audio.paused) {
+    audio.play();
+    startSeekLoop();
+  } else {
+    audio.pause();
+  }
+});
+
+$('btn-stop').addEventListener('click', () => {
+  audio.pause();
+  audio.currentTime = 0;
+  $('seek').value = 0;
+  $('btn-play').textContent = '▶ Play';
+});
+
+$('seek').addEventListener('mousedown',  () => { seeking = true; });
+$('seek').addEventListener('touchstart', () => { seeking = true; }, { passive: true });
+$('seek').addEventListener('input', () => {
+  if (!audio.duration) return;
+  const t = (parseInt($('seek').value) / 1000) * audio.duration;
+  $('time-display').textContent = `${fmt(t)} / ${fmt(audio.duration)}`;
+});
+$('seek').addEventListener('change', () => {
+  if (!audio.duration) return;
+  audio.currentTime = (parseInt($('seek').value) / 1000) * audio.duration;
+  seeking = false;
+  if (!audio.paused) startSeekLoop();
+});
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+
+(async () => {
+  const tracks = await discoverFiles();
+
+  if (tracks.length === 0) {
+    status('No audio files found. Add .wav or .mp3 files and update manifest.json.');
+    return;
+  }
+
+  songs = tracks;
+  songs.sort((a, b) => a.filename.localeCompare(b.filename));
+
+  const list = $('song-list');
+  songs.forEach((song, idx) => {
+    const li = document.createElement('li');
+    const fn = document.createElement('span');
+    fn.className = 'filename';
+    fn.textContent = song.filename;
+    li.appendChild(fn);
+    if (song.title) {
+      const mt = document.createElement('span');
+      mt.className = 'meta-title';
+      mt.textContent = song.title;
+      li.appendChild(mt);
+    }
+    li.addEventListener('click', () => playSong(idx));
+    list.appendChild(li);
+  });
+
+  status(`${songs.length} track(s) ready. Click a track to play.`);
+})();
+</script>
+</body>
+</html>
